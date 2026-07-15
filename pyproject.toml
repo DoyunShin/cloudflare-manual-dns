@@ -1,0 +1,38 @@
+[project]
+name = "cfproxy"
+version = "0.1.0"
+description = "Cloudflare Record-Scoped DNS Proxy"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "gunicorn",
+    "sqlalchemy[asyncio]>=2",
+    "asyncmy",
+    "redis>=5",
+    "httpx",
+    "cryptography",
+    "argon2-cffi",
+    "pyjwt[crypto]",
+    "pydantic-settings",
+    "prompt_toolkit",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "respx",
+    "fakeredis",
+    "aiosqlite",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cfproxy"]
