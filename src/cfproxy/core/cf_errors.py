@@ -1,0 +1,8 @@
+"""Cloudflare-compatible error code constants."""
+
+TOKEN_VALID = 10000
+TOKEN_INVALID = 1000
+RECORD_NOT_FOUND = 81044
+FORBIDDEN = 9109
+ROUTE_NOT_FOUND = 7003
+INTERNAL = 1000
