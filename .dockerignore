@@ -1,0 +1,11 @@
+.git
+.env
+*.db
+.venv
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/dist
+.claude
+BUILD_SPEC.md
+tests

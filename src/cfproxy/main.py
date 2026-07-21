@@ -7,12 +7,15 @@ process-wide database engine, Cloudflare httpx client, and Redis connection.
 """
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from cfproxy.cache.redis import get_redis
@@ -37,6 +40,63 @@ def _is_proxy_path(path: str) -> bool:
         is_proxy(bool): True if the path is under the proxy API surface.
     """
     return path.startswith(_PROXY_PATH_PREFIX)
+
+
+def _frontend_dist() -> Path | None:
+    """Locate the built SPA `dist` directory, if one is present.
+
+    Resolution order: the `FRONTEND_DIST` environment variable, the package's
+    bundled `frontend_dist` (populated by the Docker build), then the repo's
+    `frontend/dist` (local dev). Returns None when no build exists, so the API
+    still runs headless (tests, dev without a built frontend).
+
+    Return:
+        dist(Path | None): The directory containing `index.html`, or None.
+    """
+    candidates = []
+    override = os.environ.get("FRONTEND_DIST")
+    if override:
+        candidates.append(Path(override))
+    package_dir = Path(__file__).resolve().parent
+    candidates.append(package_dir / "frontend_dist")
+    candidates.append(package_dir.parents[1] / "frontend" / "dist")
+    for candidate in candidates:
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
+
+
+def _mount_frontend(app: FastAPI) -> None:
+    """Serve the built SPA (if present) with hashed assets + SPA fallback.
+
+    Mounts the immutable `/assets` bundle and adds a catch-all GET that
+    returns `index.html` for client-side routes, while never shadowing the
+    API surfaces (`/api`, `/client/v4`) or the health/docs routes, and
+    refusing any path that escapes the dist directory.
+
+    Args:
+        app(FastAPI): The application to attach static serving to.
+
+    Return:
+        None
+    """
+    dist = _frontend_dist()
+    if dist is None:
+        return
+    dist = dist.resolve()
+    assets_dir = dist / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+    index_file = dist / "index.html"
+
+    @app.get("/{full_path:path}", include_in_schema=False, response_model=None)
+    async def spa(full_path: str) -> JSONResponse | FileResponse:
+        if full_path.startswith(("api/", "client/v4")):
+            return make_response(404, "Not found")
+        candidate = (dist / full_path).resolve()
+        if full_path and str(candidate).startswith(str(dist)) and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(index_file)
 
 
 def _http_exception_to_cf_response(exc: HTTPException) -> JSONResponse:
@@ -170,6 +230,9 @@ def create_app() -> FastAPI:
         if not await check_redis():
             return JSONResponse(status_code=200, content={"status": "ok", "redis": "degraded"})
         return JSONResponse(status_code=200, content={"status": "ok", "redis": "ok"})
+
+    # Serve the built SPA last so its catch-all never shadows the API/health routes.
+    _mount_frontend(app)
 
     return app
 
