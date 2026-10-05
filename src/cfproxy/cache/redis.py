@@ -135,28 +135,30 @@ def rules_key(lookup_id: str, version: int) -> str:
     return f"rules:{lookup_id}:{version}"
 
 
-def oauth_at_key(cred_id: str) -> str:
+def oauth_at_key(cred_id: str, version: int) -> str:
     """Build the cache key for a credential's encrypted OAuth access token.
 
     Args:
         cred_id(str): The upstream credential id.
+        version(int): The current credential revision.
 
     Return:
         key(str): The Redis key for the cached access token.
     """
-    return f"oauth_at:{cred_id}"
+    return f"oauth_at:{cred_id}:{version}"
 
 
-def zones_key(cred_id: str) -> str:
+def zones_key(cred_id: str, version: int) -> str:
     """Build the cache key for a credential's cached zone list.
 
     Args:
         cred_id(str): The upstream credential id.
+        version(int): The current credential revision.
 
     Return:
         key(str): The Redis key for the cached zones.
     """
-    return f"zones:{cred_id}"
+    return f"zones:{cred_id}:{version}"
 
 
 def oauth_state_key(state: str) -> str:

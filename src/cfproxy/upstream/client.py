@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cfproxy.cache.redis import cache_get_json, cache_set_json, oauth_at_key
 from cfproxy.config import get_settings
 from cfproxy.core.crypto import decrypt_secret, encrypt_secret
+from cfproxy.core.cf_errors import INTERNAL
 from cfproxy.db.locks import with_row_lock
 from cfproxy.db.models import UpstreamCredential
 
@@ -38,6 +39,48 @@ _ALLOWED_UPSTREAM_ORIGIN = "https://api.cloudflare.com"
 _STRIPPED_AUTH_HEADERS = frozenset(
     {"authorization", "x-auth-email", "x-auth-key", "x-auth-user-service-key"}
 )
+
+
+class UpstreamError(Exception):
+    """A sanitized upstream failure with its original Cloudflare envelope."""
+
+    def __init__(self, status_code: int, message: str, envelope: dict | None = None) -> None:
+        """Initialize an upstream failure.
+
+        Args:
+            status_code: HTTP status to return to the caller.
+            message: Safe description without upstream credentials.
+            envelope: Valid Cloudflare error envelope, if available.
+
+        Returns:
+            None.
+        """
+        super().__init__(message)
+        self.status_code = status_code
+        self.envelope = envelope or {"success": False, "errors": [{"code": INTERNAL, "message": message}], "messages": [], "result": None}
+
+
+def parse_cf_response(response: httpx.Response) -> dict:
+    """Validate a Cloudflare envelope and preserve upstream failures.
+
+    Args:
+        response: The upstream HTTP response.
+
+    Returns:
+        The successful response envelope.
+
+    Raises:
+        UpstreamError: On a failed or malformed upstream response.
+    """
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise UpstreamError(502, "Invalid response from Cloudflare") from exc
+    if not isinstance(body, dict) or not isinstance(body.get("success"), bool) or not isinstance(body.get("errors"), list):
+        raise UpstreamError(502, "Invalid response from Cloudflare")
+    if response.status_code >= 400 or not body["success"]:
+        raise UpstreamError(response.status_code if response.status_code >= 400 else 502, "Cloudflare request failed", body)
+    return body
 
 
 def _assert_pinned_origin(base_url: str) -> None:
@@ -126,13 +169,19 @@ async def forward_request(
     }
     forwarded_headers.update(auth_headers)
     client = get_cf_client()
-    return await client.request(
-        method,
-        path,
-        headers=forwarded_headers,
-        params=params,
-        content=content,
-    )
+    try:
+        response = await client.request(method, path, headers=forwarded_headers, params=params, content=content)
+    except httpx.TimeoutException as exc:
+        raise UpstreamError(504, "Cloudflare request timed out") from exc
+    except httpx.RequestError as exc:
+        raise UpstreamError(502, "Cloudflare is unavailable") from exc
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise UpstreamError(502, "Invalid response from Cloudflare") from exc
+    if not isinstance(body, dict) or not isinstance(body.get("success"), bool) or not isinstance(body.get("errors"), list):
+        raise UpstreamError(502, "Invalid response from Cloudflare")
+    return response
 
 
 async def fetch_cf_record(
@@ -158,8 +207,7 @@ async def fetch_cf_record(
     )
     if response.status_code == 404:
         return None
-    response.raise_for_status()
-    return response.json()["result"]
+    return parse_cf_response(response)["result"]
 
 
 async def list_all_records(
@@ -190,8 +238,7 @@ async def list_all_records(
             content=None,
             auth_headers=auth_headers,
         )
-        response.raise_for_status()
-        body = response.json()
+        body = parse_cf_response(response)
         records.extend(body.get("result") or [])
         result_info = body.get("result_info") or {}
         total_pages = result_info.get("total_pages", 1)
@@ -272,12 +319,12 @@ async def get_valid_access_token(session: AsyncSession, credential: UpstreamCred
     settings = get_settings()
     skew = timedelta(seconds=settings.access_token_skew)
 
-    cached_enc = await cache_get_json(oauth_at_key(credential.id))
+    cached_enc = await cache_get_json(oauth_at_key(credential.id, credential.cred_version))
     if cached_enc:
         return decrypt_secret(cached_enc)
 
     stmt = with_row_lock(
-        session, select(UpstreamCredential).where(UpstreamCredential.id == credential.id)
+        session, select(UpstreamCredential).where(UpstreamCredential.id == credential.id).execution_options(populate_existing=True)
     )
     result = await session.execute(stmt)
     locked = result.scalar_one()
@@ -288,30 +335,49 @@ async def get_valid_access_token(session: AsyncSession, credential: UpstreamCred
 
     from cfproxy.auth.oauth_cf import refresh_access_token
 
-    token_data = await refresh_access_token(decrypt_secret(locked.refresh_token_enc))
+    try:
+        token_data = await refresh_access_token(decrypt_secret(locked.refresh_token_enc))
+    except httpx.TimeoutException as exc:
+        raise UpstreamError(504, "Cloudflare credential refresh timed out") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise UpstreamError(502, "Cloudflare credential refresh failed") from exc
+    if not isinstance(token_data, dict) or not isinstance(token_data.get("access_token"), str) or not token_data["access_token"]:
+        raise UpstreamError(502, "Invalid Cloudflare refresh response")
+    if token_data.get("refresh_token") is not None and not isinstance(token_data["refresh_token"], str):
+        raise UpstreamError(502, "Invalid Cloudflare refresh response")
+    if token_data.get("expires_in") is not None and (type(token_data["expires_in"]) is not int or not 0 < token_data["expires_in"] <= 31536000):
+        raise UpstreamError(502, "Invalid Cloudflare refresh lifetime")
 
     new_access_token = token_data["access_token"]
     new_refresh_token = token_data.get("refresh_token") or decrypt_secret(locked.refresh_token_enc)
     expires_in = token_data.get("expires_in")
     new_expires_at = now + timedelta(seconds=expires_in) if expires_in is not None else None
 
-    await session.execute(
+    locked_version = locked.cred_version
+    refreshed = await session.execute(
         update(UpstreamCredential)
         .where(
             UpstreamCredential.id == credential.id,
-            UpstreamCredential.cred_version == locked.cred_version,
+            UpstreamCredential.cred_version == locked_version,
         )
         .values(
             access_token_enc=encrypt_secret(new_access_token),
             refresh_token_enc=encrypt_secret(new_refresh_token),
             token_expires_at=new_expires_at,
-            cred_version=locked.cred_version + 1,
+            cred_version=locked_version + 1,
         )
     )
+    if refreshed.rowcount != 1:
+        await session.rollback()
+        result = await session.execute(stmt)
+        winner = result.scalar_one()
+        if winner.token_expires_at is None or winner.token_expires_at - skew <= datetime.now(UTC):
+            raise UpstreamError(503, "Cloudflare credential changed; retry the request")
+        return decrypt_secret(winner.access_token_enc)
     await session.commit()
 
     if expires_in is not None:
         ttl = max(int(expires_in) - settings.access_token_skew, 1)
-        await cache_set_json(oauth_at_key(credential.id), encrypt_secret(new_access_token), ttl)
+        await cache_set_json(oauth_at_key(credential.id, locked_version + 1), encrypt_secret(new_access_token), ttl)
 
     return new_access_token

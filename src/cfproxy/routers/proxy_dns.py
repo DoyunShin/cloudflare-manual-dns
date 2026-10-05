@@ -31,6 +31,7 @@ from cfproxy.upstream.client import (
     fetch_cf_record,
     forward_request,
     list_all_records,
+    parse_cf_response,
     resolve_upstream_auth,
 )
 
@@ -162,9 +163,7 @@ async def _fetch_all_zones(
             content=None,
             auth_headers=auth_headers,
         )
-        body = response.json()
-        if response.status_code >= 400 or not body.get("success", False):
-            return zones
+        body = parse_cf_response(response)
         zones.extend(body.get("result") or [])
         result_info = body.get("result_info") or {}
         total_pages = result_info.get("total_pages", 1)

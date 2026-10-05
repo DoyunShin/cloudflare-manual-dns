@@ -19,6 +19,7 @@ from cfproxy.upstream.client import (
     list_all_records,
     resolve_upstream_auth,
     verify_upstream,
+    UpstreamError,
 )
 
 BASE_URL = get_settings().upstream_base_url
@@ -305,7 +306,7 @@ async def test_get_valid_access_token_oauth_cache_hit(db_session) -> None:
     db_session.add(credential)
     await db_session.commit()
 
-    await cache_set_json(oauth_at_key(credential.id), encrypt_secret("cached-access-token"), 300)
+    await cache_set_json(oauth_at_key(credential.id, credential.cred_version), encrypt_secret("cached-access-token"), 300)
 
     token = await get_valid_access_token(db_session, credential)
     assert token == "cached-access-token"
@@ -369,7 +370,7 @@ async def test_get_valid_access_token_oauth_refreshes_when_expired(db_session, m
     assert decrypt_secret(credential.refresh_token_enc) == "new-refresh-token"
     assert credential.cred_version == 2
 
-    cached = await cache_get_json(oauth_at_key(credential.id))
+    cached = await cache_get_json(oauth_at_key(credential.id, credential.cred_version))
     assert decrypt_secret(cached) == "new-access-token"
 
 
@@ -405,3 +406,34 @@ async def test_get_valid_access_token_oauth_refresh_reuses_refresh_token_if_not_
 
     await db_session.refresh(credential)
     assert decrypt_secret(credential.refresh_token_enc) == "stable-refresh-token"
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
+async def test_record_fetch_preserves_upstream_error(respx_mock, status: int) -> None:
+    """Fetching a pre-image preserves a valid Cloudflare error instead of 500."""
+    body = {"success": False, "errors": [{"code": 9109, "message": "upstream denied"}], "messages": [], "result": None}
+    respx_mock.get(f"{BASE_URL}/client/v4/zones/zone1/dns_records/rec1").respond(status, json=body)
+    with pytest.raises(UpstreamError) as caught:
+        await fetch_cf_record("zone1", "rec1", {"Authorization": "Bearer hidden"})
+    assert caught.value.status_code == status
+    assert caught.value.envelope == body
+
+
+async def test_non_json_cloudflare_response_is_bad_gateway(respx_mock) -> None:
+    """An upstream HTML error becomes a sanitized 502."""
+    respx_mock.get(f"{BASE_URL}/client/v4/zones").respond(503, text="upstream HTML")
+    with pytest.raises(UpstreamError) as caught:
+        await forward_request("GET", "/client/v4/zones", headers=None, params=None, content=None, auth_headers={})
+    assert caught.value.status_code == 502
+
+
+async def test_oauth_cache_is_revision_scoped(db_session) -> None:
+    """A reconnect revision makes a previously cached grant unreachable."""
+    user = User(email="revision@example.com")
+    db_session.add(user)
+    await db_session.flush()
+    credential = UpstreamCredential(user_id=user.id, label="revision", cred_type="oauth", cred_version=2, access_token_enc=encrypt_secret("new-access"), token_expires_at=datetime.now(UTC) + timedelta(hours=1))
+    db_session.add(credential)
+    await db_session.commit()
+    await cache_set_json(oauth_at_key(credential.id, 1), encrypt_secret("old-access"), 300)
+    assert await get_valid_access_token(db_session, credential) == "new-access"

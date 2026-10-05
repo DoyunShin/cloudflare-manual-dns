@@ -24,9 +24,11 @@ from cfproxy.cache.redis import (
 from cfproxy.config import get_settings
 from cfproxy.core.crypto import encrypt_secret
 from cfproxy.db.models import ScopedToken, UpstreamCredential
+from cfproxy.db.locks import with_row_lock
 from cfproxy.upstream.client import (
     forward_request,
     list_all_records,
+    parse_cf_response,
     resolve_upstream_auth,
     verify_upstream,
 )
@@ -191,13 +193,17 @@ async def delete_credential(session: AsyncSession, user_id: str, credential_id: 
     Raises:
         NotFoundError: If the credential does not exist or is not owned by `user_id`.
     """
-    credential = await get_owned_credential(session, user_id, credential_id)
-
+    result = await session.execute(with_row_lock(session, select(UpstreamCredential).where(UpstreamCredential.id == credential_id, UpstreamCredential.user_id == user_id).execution_options(populate_existing=True)))
+    credential = result.scalar_one_or_none()
+    if credential is None:
+        raise NotFoundError(f"upstream credential {credential_id!r} not found")
+    old_cred_version = credential.cred_version
+    invalidation_keys = []
     dependent_tokens = await session.execute(
-        select(ScopedToken).where(
+        with_row_lock(session, select(ScopedToken).where(
             ScopedToken.upstream_credential_id == credential_id,
             ScopedToken.status == "active",
-        )
+        ))
     )
     for scoped_token in dependent_tokens.scalars().all():
         old_lookup_id = scoped_token.lookup_id
@@ -205,11 +211,12 @@ async def delete_credential(session: AsyncSession, user_id: str, credential_id: 
         scoped_token.status = "revoked"
         scoped_token.revoked_at = datetime.now(UTC)
         scoped_token.version = old_version + 1
-        await cache_del(rules_key(old_lookup_id, old_version))
+        invalidation_keys.append(rules_key(old_lookup_id, old_version))
 
-    await cache_del(oauth_at_key(credential_id), zones_key(credential_id))
+    await session.flush()
     await session.delete(credential)
     await session.commit()
+    await cache_del(*invalidation_keys, oauth_at_key(credential_id, old_cred_version), zones_key(credential_id, old_cred_version))
 
 
 async def list_credential_zones(
@@ -230,7 +237,7 @@ async def list_credential_zones(
     """
     credential = await get_owned_credential(session, user_id, credential_id)
 
-    key = zones_key(credential_id)
+    key = zones_key(credential_id, credential.cred_version)
     cached = await cache_get_json(key)
     if cached is not None:
         return cached
@@ -248,8 +255,7 @@ async def list_credential_zones(
             content=None,
             auth_headers=auth_headers,
         )
-        response.raise_for_status()
-        body = response.json()
+        body = parse_cf_response(response)
         zones.extend(body.get("result") or [])
         result_info = body.get("result_info") or {}
         total_pages = result_info.get("total_pages", 1)

@@ -21,6 +21,7 @@ from cfproxy.core.envelopes import make_cf_error
 from cfproxy.db.models import AuditLog, ScopedToken, ScopeRule, UpstreamCredential, User
 from cfproxy.db.session import get_session
 from cfproxy.routers import proxy_blocked, proxy_dns, proxy_verify
+from cfproxy.upstream.client import UpstreamError
 
 BASE_URL = get_settings().upstream_base_url
 
@@ -44,6 +45,10 @@ def _build_app() -> FastAPI:
     app.include_router(proxy_verify.router)
     app.include_router(proxy_dns.router)
     app.include_router(proxy_blocked.router)
+
+    @app.exception_handler(UpstreamError)
+    async def _handle_upstream_error(request, exc: UpstreamError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content=exc.envelope)
 
     @app.exception_handler(HTTPException)
     async def _handle_proxy_http_exception(request, exc: HTTPException) -> JSONResponse:
@@ -127,6 +132,42 @@ def _auth_headers(full_token: str) -> dict[str, str]:
         headers(dict[str, str]): The header mapping for a request.
     """
     return {"Authorization": f"Bearer {full_token}"}
+
+
+@pytest.mark.asyncio
+async def test_zone_list_does_not_return_partial_success(db_session, async_client_factory, respx_mock) -> None:
+    """A failed later upstream page must fail the complete zone-list operation."""
+    scoped_token, full_token, _credential = await _make_scoped_token(db_session)
+    await _add_rule(db_session, scoped_token)
+    failure = {"success": False, "errors": [{"code": 9109, "message": "Cloudflare denied"}], "messages": [], "result": None}
+
+    def responder(request):
+        if request.url.params["page"] == "1":
+            return Response(200, json={"success": True, "errors": [], "messages": [], "result": [{"id": "zone1", "name": "example.com"}], "result_info": {"total_pages": 2}})
+        return Response(403, json=failure)
+
+    respx_mock.get(f"{BASE_URL}/client/v4/zones").mock(side_effect=responder)
+    app = _build_app()
+    app.dependency_overrides[get_session] = lambda: db_session
+    async with async_client_factory(app) as client:
+        response = await client.get("/client/v4/zones", headers=_auth_headers(full_token))
+    assert response.status_code == 403
+    assert response.json() == failure
+
+
+@pytest.mark.asyncio
+async def test_cached_content_lock_denies_before_upstream_mutation(db_session, async_client_factory, respx_mock) -> None:
+    """Both DB and cached rules enforce content restrictions without a rename."""
+    scoped_token, full_token, _credential = await _make_scoped_token(db_session)
+    await _add_rule(db_session, scoped_token, allow_create=True, content_lock="192.0.2.1")
+    route = respx_mock.post(f"{BASE_URL}/client/v4/zones/zone1/dns_records").respond(200, json={"success": True, "errors": [], "messages": [], "result": {}})
+    app = _build_app()
+    app.dependency_overrides[get_session] = lambda: db_session
+    async with async_client_factory(app) as client:
+        for _ in range(2):
+            response = await client.post("/client/v4/zones/zone1/dns_records", json={"name": "home.example.com", "type": "A", "content": "192.0.2.2"}, headers=_auth_headers(full_token))
+            assert response.status_code == 403
+    assert route.call_count == 0
 
 
 # ---------------------------------------------------------------------------

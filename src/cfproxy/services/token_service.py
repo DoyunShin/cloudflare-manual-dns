@@ -13,12 +13,13 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cfproxy.authz.scope import validate_name_pattern
+from cfproxy.authz.scope import normalize_fqdn, validate_name_pattern
 from cfproxy.cache.redis import cache_del, rules_key
 from cfproxy.core.crypto import generate_scoped_token
 from cfproxy.db.models import ScopedToken, ScopeRule, UpstreamCredential
+from cfproxy.db.locks import with_row_lock
 from cfproxy.services.credential_service import NotFoundError, get_owned_credential
-from cfproxy.upstream.client import forward_request, resolve_upstream_auth
+from cfproxy.upstream.client import forward_request, parse_cf_response, resolve_upstream_auth
 
 
 @dataclass
@@ -61,9 +62,7 @@ async def _resolve_zone_name(zone_id: str, auth_headers: dict[str, str], cache: 
     )
     if response.status_code == 404:
         raise ValueError(f"zone {zone_id!r} not found upstream")
-    response.raise_for_status()
-
-    zone_name = response.json()["result"]["name"]
+    zone_name = parse_cf_response(response)["result"]["name"]
     cache[zone_id] = zone_name
     return zone_name
 
@@ -108,6 +107,8 @@ async def _validate_scope_rules(
                 auth_headers = await resolve_upstream_auth(session, credential)
             zone_name = await _resolve_zone_name(rule["zone_id"], auth_headers, zone_name_cache)
             validate_name_pattern(rule["name_pattern"], rule.get("name_match", "exact"), zone_name)
+            if rule["name_pattern"] == "@":
+                rule["name_pattern"] = normalize_fqdn(zone_name)
 
 
 async def mint_scoped_token(
@@ -146,6 +147,10 @@ async def mint_scoped_token(
     """
     credential = await get_owned_credential(session, user_id, upstream_credential_id)
     await _validate_scope_rules(session, credential, scope_rules)
+
+    result = await session.execute(with_row_lock(session, select(UpstreamCredential).where(UpstreamCredential.id == upstream_credential_id, UpstreamCredential.user_id == user_id).execution_options(populate_existing=True)))
+    if result.scalar_one_or_none() is None:
+        raise NotFoundError(f"upstream credential {upstream_credential_id!r} not found")
 
     generated = generate_scoped_token()
 
