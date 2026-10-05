@@ -22,8 +22,8 @@ from cfproxy.cache.redis import get_redis
 from cfproxy.core.cf_errors import INTERNAL
 from cfproxy.core.envelopes import make_cf_error, make_response
 from cfproxy.db.session import engine
-from cfproxy.routers import audit, auth, credentials, proxy_blocked, proxy_dns, proxy_verify, tokens
-from cfproxy.upstream.client import close_cf_client, get_cf_client
+from cfproxy.routers import admin, audit, auth, credentials, oidc, proxy_blocked, proxy_dns, proxy_verify, tokens
+from cfproxy.upstream.client import UpstreamError, close_cf_client, get_cf_client
 
 logger = logging.getLogger(__name__)
 
@@ -91,10 +91,12 @@ def _mount_frontend(app: FastAPI) -> None:
 
     @app.get("/{full_path:path}", include_in_schema=False, response_model=None)
     async def spa(full_path: str) -> JSONResponse | FileResponse:
-        if full_path.startswith(("api/", "client/v4")):
+        if full_path == "api" or full_path.startswith(("api/", "client/v4")):
             return make_response(404, "Not found")
         candidate = (dist / full_path).resolve()
-        if full_path and str(candidate).startswith(str(dist)) and candidate.is_file():
+        if not candidate.is_relative_to(dist):
+            return make_response(404, "Not found")
+        if full_path and candidate.is_file():
             return FileResponse(candidate)
         return FileResponse(index_file)
 
@@ -186,12 +188,21 @@ def create_app() -> FastAPI:
     app = FastAPI(title="cfproxy", lifespan=_lifespan)
 
     app.include_router(auth.router)
+    app.include_router(admin.router)
+    app.include_router(oidc.router)
+    app.include_router(oidc.admin_router)
     app.include_router(credentials.router)
     app.include_router(tokens.router)
     app.include_router(audit.router)
     app.include_router(proxy_verify.router)
     app.include_router(proxy_dns.router)
     app.include_router(proxy_blocked.router)
+
+    @app.exception_handler(UpstreamError)
+    async def handle_upstream_error(request: Request, exc: UpstreamError) -> JSONResponse:
+        if _is_proxy_path(request.url.path):
+            return JSONResponse(status_code=exc.status_code, content=exc.envelope)
+        return make_response(exc.status_code, str(exc))
 
     @app.exception_handler(HTTPException)
     async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
@@ -205,7 +216,8 @@ def create_app() -> FastAPI:
     ) -> JSONResponse:
         if _is_proxy_path(request.url.path):
             return make_cf_error(400, INTERNAL, "Invalid request")
-        return make_response(422, "Validation error", exc.errors())
+        errors = [{key: error[key] for key in ("type", "loc", "msg") if key in error} for error in exc.errors()]
+        return make_response(422, "Validation error", errors)
 
     @app.exception_handler(Exception)
     async def handle_generic_error(request: Request, exc: Exception) -> JSONResponse:

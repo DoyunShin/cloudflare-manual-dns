@@ -17,9 +17,9 @@ from cryptography.fernet import Fernet
 _tmp_db_fd, _tmp_db_path = tempfile.mkstemp(suffix=".db")
 os.close(_tmp_db_fd)
 
-os.environ.setdefault("DB_URL", f"sqlite+aiosqlite:///{_tmp_db_path}")
+os.environ["DB_URL"] = f"sqlite+aiosqlite:///{_tmp_db_path}"
 os.environ.setdefault("PROXY_SECRET_KEY", Fernet.generate_key().decode())
-os.environ.setdefault("APP_BASE_URL", "https://testserver")
+os.environ["APP_BASE_URL"] = "https://testserver"
 
 import fakeredis.aioredis
 import httpx

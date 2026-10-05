@@ -6,24 +6,19 @@ cache invalidation), the CF OAuth callback happy path, and cross-user IDOR
 protection across every id-addressed operation.
 """
 
-import time
+from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
-import httpx
-import jwt as pyjwt
 import pytest
-import respx
-from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import Response
-from jwt.algorithms import RSAAlgorithm
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cfproxy.auth import oauth_cf
 from cfproxy.cache.redis import cache_get_json, cache_set_json, rules_key
 from cfproxy.config import get_settings
 from cfproxy.core.crypto import decrypt_secret, hash_token
-from cfproxy.db.models import ScopedToken, User
+from cfproxy.db.models import ManagementSession, OIDCConfig, ScopedToken, UpstreamCredential, User
 from cfproxy.services import oauth_service
 from cfproxy.services.audit_service import list_audit_logs, write_audit
 from cfproxy.services.credential_service import (
@@ -69,6 +64,16 @@ def _record_ids_rule(**overrides) -> dict:
     }
     rule.update(overrides)
     return rule
+
+
+async def test_mint_apex_marker_is_stored_as_zone_name(db_session: AsyncSession, respx_mock) -> None:
+    """The accepted apex marker must match real DNS names after persistence."""
+    user = await _make_user(db_session)
+    credential = await register_credential(db_session, user.id, label="apex", cred_type="token", api_token="hidden")
+    respx_mock.get(f"{get_settings().upstream_base_url}/client/v4/zones/zone1").respond(200, json={"success": True, "errors": [], "messages": [], "result": {"name": "Example.COM"}})
+    minted = await mint_scoped_token(db_session, user.id, name="apex", upstream_credential_id=credential.id, scope_rules=[_record_ids_rule(name_pattern="@", record_ids=None, record_types=["A"])])
+    detail = await get_scoped_token_detail(db_session, user.id, minted["id"])
+    assert detail.rules[0].name_pattern == "example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +201,12 @@ async def test_list_and_delete_credential_cascade_revokes_tokens(
     assert row.status == "revoked"
     assert row.version == 2
     assert row.revoked_at is not None
+    await db_session.refresh(row)
+    assert row.upstream_credential_id is None
+    detail = await get_scoped_token_detail(db_session, user.id, row.id)
+    assert len(detail.rules) == 1
+    with pytest.raises(NotFoundError):
+        await mint_scoped_token(db_session, user.id, name="deleted", upstream_credential_id=credential.id, scope_rules=[_record_ids_rule()])
 
 
 async def test_list_credential_zones_caches_result(db_session: AsyncSession, respx_mock) -> None:
@@ -422,104 +433,122 @@ async def test_revoke_scoped_token_bumps_version_and_invalidates_cache(
 
 
 # ---------------------------------------------------------------------------
-# oauth_service: CF OAuth callback happy path
+# oauth_service: authenticated CF credential connection
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _reset_jwks_cache():
-    """Ensure the module-level JWKS cache never leaks between tests."""
-    oauth_cf.clear_jwks_cache()
-    yield
-    oauth_cf.clear_jwks_cache()
 
 
 @pytest.fixture
 def oauth_settings(monkeypatch: pytest.MonkeyPatch):
-    """Point oauth_cf at deterministic OAuth client settings for this test."""
+    """Install deterministic Cloudflare credential-consent settings."""
     base = get_settings()
     overridden = base.model_copy(
         update={
             "cf_oauth_client_id": "test-client-id",
             "cf_oauth_client_secret": "test-client-secret",
-            "cf_oauth_redirect_uri": "https://app.example.com/auth/cf/callback",
             "cf_oauth_issuer": "https://dash.cloudflare.com",
+            "app_base_url": "https://app.example.com",
         }
     )
-    monkeypatch.setattr(oauth_cf, "get_settings", lambda: overridden)
     monkeypatch.setattr(oauth_service, "get_settings", lambda: overridden)
     return overridden
 
 
-def _build_jwks(public_key, kid: str) -> dict:
-    """Build a JWKS document exposing a single RSA public key."""
-    jwk = RSAAlgorithm.to_jwk(public_key, as_dict=True)
-    jwk["kid"] = kid
-    jwk["use"] = "sig"
-    jwk["alg"] = "RS256"
-    return {"keys": [jwk]}
+async def test_oauth_callback_attaches_credential_to_existing_session_user(db_session: AsyncSession, oauth_settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cloudflare consent stores a credential without creating an identity or login session."""
+    user = await _make_user(db_session)
+    management_session = ManagementSession(
+        token_hash="a" * 64,
+        user_id=user.id,
+        auth_method="local",
+        csrf_secret="csrf",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    db_session.add(management_session)
+    await db_session.commit()
+    await db_session.refresh(management_session)
 
-
-async def test_oauth_callback_happy_path(
-    db_session: AsyncSession, oauth_settings
-) -> None:
-    """A full login->callback round trip upserts the user, stores the oauth
-    credential, and issues a valid session JWT."""
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    jwks = _build_jwks(public_key, CF_KID)
-
-    async with respx.mock(base_url="https://dash.cloudflare.com") as mock:
-        mock.get("/.well-known/jwks.json").mock(return_value=httpx.Response(200, json=jwks))
-
-        authorize_url = await oauth_service.start_cf_oauth_login()
-        assert "state=" in authorize_url
-        state = authorize_url.split("state=")[1].split("&")[0]
-
-        stored = await cache_get_json(f"oauth_state:{state}")
-        nonce = stored["nonce"]
-
-        now = int(time.time())
-        claims = {
-            "iss": oauth_settings.cf_oauth_issuer,
-            "aud": oauth_settings.cf_oauth_client_id,
-            "sub": "cf-user-abc123",
-            "email": "operator@example.com",
-            "exp": now + 300,
-            "iat": now,
-            "nbf": now,
-            "nonce": nonce,
-        }
-        id_token = pyjwt.encode(claims, private_key, algorithm="RS256", headers={"kid": CF_KID})
-
-        token_response = {
+    async def fake_exchange(code: str, verifier: str) -> dict:
+        assert code == "auth-code-1"
+        assert verifier
+        return {
             "access_token": "at-abc",
             "refresh_token": "rt-abc",
-            "id_token": id_token,
-            "token_type": "bearer",
             "expires_in": 3600,
-            "scope": "openid offline_access",
+            "scope": "offline_access dns.write",
         }
-        mock.post("/oauth2/token").mock(return_value=httpx.Response(200, json=token_response))
 
-        user, session_jwt = await oauth_service.handle_cf_oauth_callback(
-            db_session, code="auth-code-1", state=state
+    monkeypatch.setattr(oauth_service, "exchange_code", fake_exchange)
+    authorize_url = await oauth_service.start_cf_oauth_connect(user.id, management_session.id)
+    state = parse_qs(urlsplit(authorize_url).query)["state"][0]
+    credential = await oauth_service.complete_cf_oauth_connect(
+        db_session, "auth-code-1", state, user.id, management_session.id
+    )
+
+    assert credential.user_id == user.id
+    assert credential.cred_type == "oauth"
+    assert decrypt_secret(credential.access_token_enc) == "at-abc"
+    assert decrypt_secret(credential.refresh_token_enc) == "rt-abc"
+    user_count = len((await db_session.execute(select(User))).scalars().all())
+    assert user_count == 1
+
+    with pytest.raises(oauth_service.CloudflareOAuthStateError):
+        await oauth_service.complete_cf_oauth_connect(
+            db_session, "auth-code-2", state, user.id, management_session.id
         )
 
-    assert user.cf_sub == "cf-user-abc123"
-    assert user.email == "operator@example.com"
-    assert user.auth_provider == "cloudflare_oauth"
-    assert session_jwt
 
-    result = await db_session.execute(
-        select(User).where(User.cf_sub == "cf-user-abc123")
-    )
-    persisted_user = result.scalar_one()
-    assert persisted_user.id == user.id
+async def test_oauth_callback_rejects_a_different_service_session(db_session: AsyncSession, oauth_settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A callback cannot attach its grant through another active service session."""
+    user = await _make_user(db_session)
+    sessions = [
+        ManagementSession(
+            token_hash=character * 64,
+            user_id=user.id,
+            auth_method="local",
+            csrf_secret=f"csrf-{character}",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        for character in ("b", "c")
+    ]
+    db_session.add_all(sessions)
+    await db_session.commit()
+    authorize_url = await oauth_service.start_cf_oauth_connect(user.id, sessions[0].id)
+    state = parse_qs(urlsplit(authorize_url).query)["state"][0]
 
-    # The oauth state is single-use: replaying it must fail.
-    with pytest.raises(ValueError):
-        await oauth_service.handle_cf_oauth_callback(db_session, code="auth-code-2", state=state)
+    with pytest.raises(oauth_service.CloudflareOAuthStateError):
+        await oauth_service.complete_cf_oauth_connect(
+            db_session, "auth-code", state, user.id, sessions[1].id
+        )
+
+    credentials = (await db_session.execute(select(UpstreamCredential))).scalars().all()
+    assert credentials == []
+
+
+@pytest.mark.parametrize("provider_change", ["revision", "disabled"])
+async def test_oauth_callback_rechecks_oidc_session_after_token_exchange(db_session: AsyncSession, oauth_settings, monkeypatch: pytest.MonkeyPatch, provider_change: str) -> None:
+    """Provider changes during consent prevent an invalidated session from linking grants."""
+    user = await _make_user(db_session)
+    config = await db_session.get(OIDCConfig, 1)
+    config.enabled = True
+    config.revision = 4
+    management_session = ManagementSession(token_hash="d" * 64, user_id=user.id, auth_method="oidc", provider_revision=4, csrf_secret="csrf", expires_at=datetime.now(UTC) + timedelta(hours=1))
+    db_session.add(management_session)
+    await db_session.commit()
+    authorization_url = await oauth_service.start_cf_oauth_connect(user.id, management_session.id)
+    state = parse_qs(urlsplit(authorization_url).query)["state"][0]
+
+    async def exchange_with_provider_change(code: str, verifier: str) -> dict:
+        if provider_change == "revision":
+            config.revision += 1
+        else:
+            config.enabled = False
+        await db_session.commit()
+        return {"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600}
+
+    monkeypatch.setattr(oauth_service, "exchange_code", exchange_with_provider_change)
+    with pytest.raises(oauth_service.CloudflareOAuthStateError):
+        await oauth_service.complete_cf_oauth_connect(db_session, "auth-code", state, user.id, management_session.id)
+    assert (await db_session.execute(select(UpstreamCredential).where(UpstreamCredential.user_id == user.id))).scalars().all() == []
 
 
 # ---------------------------------------------------------------------------

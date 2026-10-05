@@ -20,7 +20,6 @@ class Settings(BaseSettings):
         cf_oauth_issuer(str): Cloudflare OAuth issuer base URL.
         cf_oauth_client_id(str): OAuth client id registered with Cloudflare.
         cf_oauth_client_secret(str): OAuth client secret registered with Cloudflare.
-        cf_oauth_redirect_uri(str): OAuth redirect URI registered with Cloudflare.
         cf_oauth_base_scopes(str): Space-separated base OAuth scopes to request.
         cf_oauth_dns_scope(str): DNS-specific OAuth scope to request.
         token_brand(str): Prefix used for scoped token strings.
@@ -41,7 +40,6 @@ class Settings(BaseSettings):
     cf_oauth_issuer: str = "https://dash.cloudflare.com"
     cf_oauth_client_id: str = ""
     cf_oauth_client_secret: str = ""
-    cf_oauth_redirect_uri: str = ""
     cf_oauth_base_scopes: str = "openid offline_access"
     cf_oauth_dns_scope: str = ""
     token_brand: str = "cfsx"

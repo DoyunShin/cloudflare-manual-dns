@@ -3,18 +3,19 @@ upstream Cloudflare credentials, plus the scope-builder helpers that list a
 credential's visible zones and records.
 """
 
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cfproxy.core.envelopes import make_response
-from cfproxy.core.security import get_current_user
+from cfproxy.config import get_settings
+from cfproxy.core.security import get_current_user, require_csrf
 from cfproxy.db.models import User
 from cfproxy.db.session import get_session
 from cfproxy.schemas.management import UpstreamCredentialCreateRequest, UpstreamCredentialResponse
-from cfproxy.services import credential_service
+from cfproxy.services import credential_service, oauth_service
 
 router = APIRouter(prefix="/api/v1/upstream-credentials", tags=["Upstream Credentials"])
 
@@ -47,6 +48,115 @@ def _credential_response_data(credential) -> dict:
         data(dict): The `UpstreamCredentialResponse` payload, secrets never included.
     """
     return UpstreamCredentialResponse.model_validate(credential).model_dump(mode="json")
+
+
+def _cf_callback_redirect(status: str) -> RedirectResponse:
+    """Build a fixed-origin credential-page redirect for Cloudflare OAuth."""
+    query = "cf_status=connected" if status == "success" else f"cf_error={status}"
+    return RedirectResponse(
+        f"{get_settings().app_base_url}/credentials?{query}", status_code=302
+    )
+
+
+def _cf_oauth_response_doc(status: int, summary: str, message: str, data: Any = None) -> dict[str, Any]:
+    """Document a Cloudflare credential-consent management response."""
+    return {
+        "description": summary,
+        "content": {
+            "application/json": {
+                "examples": {
+                    "result": {
+                        "summary": summary,
+                        "value": {"status": status, "message": message, "data": data},
+                    }
+                }
+            }
+        },
+    }
+
+
+@router.post(
+    "/cf/connect",
+    responses={
+        200: _cf_oauth_response_doc(200, "Cloudflare authorization URL created", "Cloudflare authorization started", {"authorization_url": "https://dash.cloudflare.com/oauth2/auth?response_type=code&client_id=cfproxy&state=single-use-state"}),
+        400: _cf_oauth_response_doc(400, "Cloudflare OAuth is not configured", "Cloudflare OAuth is not configured"),
+        401: _cf_oauth_response_doc(401, "Not authenticated", "Not authenticated"),
+        403: _cf_oauth_response_doc(403, "CSRF validation failed", "Invalid CSRF token"),
+        503: _cf_oauth_response_doc(503, "OAuth state storage unavailable", "Cloudflare OAuth is temporarily unavailable"),
+    },
+)
+async def connect_cloudflare_oauth(request: Request, current_user: Annotated[User, Depends(require_csrf)]) -> JSONResponse:
+    """Start Cloudflare OAuth consent for the active service user.
+
+    Args:
+        request: Browser request carrying the validated service session.
+        current_user: Authenticated user with validated CSRF credentials.
+
+    Returns:
+        Standard envelope containing the authorization URL or a safe error.
+    """
+    management_session = request.state.management_session
+    try:
+        authorization_url = await oauth_service.start_cf_oauth_connect(
+            current_user.id, management_session.id
+        )
+    except oauth_service.CloudflareOAuthStateError:
+        return make_response(503, "Cloudflare OAuth is temporarily unavailable")
+    except oauth_service.CloudflareOAuthError as exc:
+        return make_response(400, str(exc))
+    return make_response(200, "Cloudflare authorization started", {"authorization_url": authorization_url})
+
+
+@router.get(
+    "/cf/callback",
+    responses={
+        302: {
+            "description": "Redirect to the fixed credential-page result",
+            "headers": {"Location": {"schema": {"type": "string"}, "example": "https://app.example.com/credentials?cf_status=connected"}},
+        },
+        401: _cf_oauth_response_doc(401, "The initiating service session is no longer active", "Invalid or expired session"),
+        422: _cf_oauth_response_doc(422, "Invalid callback query parameters", "Validation error", [{"type": "string_too_long", "loc": ["query", "state"], "msg": "String should have at most 1024 characters"}]),
+    },
+)
+async def complete_cloudflare_oauth(request: Request, current_user: Annotated[User, Depends(get_current_user)], session: Annotated[AsyncSession, Depends(get_session)], state: Annotated[str | None, Query(max_length=1024)] = None, code: Annotated[str | None, Query(max_length=8192)] = None, error: Annotated[str | None, Query(max_length=255)] = None) -> RedirectResponse:
+    """Attach delegated Cloudflare tokens to the initiating service user.
+
+    Args:
+        request: Browser request carrying the initiating service session.
+        current_user: Authenticated service user.
+        session: Database session used to persist the delegated credential.
+        state: Single-use Cloudflare consent state.
+        code: Provider authorization code when consent succeeds.
+        error: Provider error when consent is declined.
+
+    Returns:
+        Fixed-origin redirect to the credential page with the consent result.
+    """
+    management_session = request.state.management_session
+    try:
+        if state is None:
+            raise oauth_service.CloudflareOAuthStateError("Cloudflare OAuth state is missing")
+        if error is not None:
+            await oauth_service.reject_cf_oauth_callback(
+                state, current_user.id, management_session.id
+            )
+            return _cf_callback_redirect("provider")
+        if code is None:
+            raise oauth_service.CloudflareOAuthStateError("Cloudflare OAuth code is missing")
+        await oauth_service.complete_cf_oauth_connect(
+            session,
+            code,
+            state,
+            current_user.id,
+            management_session.id,
+        )
+    except oauth_service.CloudflareOAuthStateError:
+        await session.rollback()
+        return _cf_callback_redirect("state")
+    except oauth_service.CloudflareOAuthError:
+        await session.rollback()
+        return _cf_callback_redirect("provider")
+    return _cf_callback_redirect("success")
 
 
 @router.post(

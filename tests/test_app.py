@@ -66,16 +66,37 @@ async def test_catch_all_proxy_route_returns_cf_404(client: httpx.AsyncClient) -
     assert body["result"] is None
 
 
-async def test_mgmt_register_route_is_reachable(client: httpx.AsyncClient) -> None:
-    """A management route (`POST /api/v1/auth/register`) is wired up and
-    answers with the standard `{status,message,data}` envelope.
-    """
-    response = await client.post(
-        "/api/v1/auth/register",
-        json={"email": "app-smoke-test@example.com", "password": "correct-horse-battery-staple"},
-    )
-    assert response.status_code == 201
+async def test_mgmt_auth_route_is_reachable(client: httpx.AsyncClient) -> None:
+    """An unauthenticated management request has the standard envelope."""
+    response = await client.get("/api/v1/auth/me")
+    assert response.status_code == 401
     body = response.json()
-    assert body["status"] == 201
-    assert body["message"] == "User registered"
-    assert body["data"]["email"] == "app-smoke-test@example.com"
+    assert body["status"] == 401
+    assert body["data"] is None
+
+
+async def test_login_validation_does_not_echo_password(client: httpx.AsyncClient) -> None:
+    """Validation errors exclude sensitive input values and exception contexts."""
+    secret = "sensitive-password-value-" * 10
+    response = await client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": secret})
+    assert response.status_code == 422
+    assert secret not in response.text
+    assert response.json()["data"][0]["loc"] == ["body", "password"]
+
+
+async def test_spa_rejects_sibling_and_symlink_escape(tmp_path, monkeypatch) -> None:
+    """Sibling-prefix traversal and symlinks must not expose files outside dist."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>Application</html>")
+    sibling = tmp_path / "dist_private"
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("private")
+    (dist / "escape.txt").symlink_to(sibling / "secret.txt")
+    monkeypatch.setenv("FRONTEND_DIST", str(dist))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app()), base_url="https://testserver") as client:
+        for path in ("/..%2Fdist_private%2Fsecret.txt", "/escape.txt", "/api", "/api/missing"):
+            response = await client.get(path)
+            assert response.status_code == 404
+            assert "private" not in response.text
+        assert (await client.get("/dashboard")).status_code == 200
