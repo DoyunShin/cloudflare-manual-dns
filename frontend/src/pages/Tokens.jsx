@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { apiDelete, apiGet, apiPost } from '../api/client.js'
 import {
   Badge, Button, Code, CopyButton, EmptyState, Field, Input, Modal, PageHeader, Panel, Select, Spinner, Table, Toggle, useToast,
@@ -179,6 +179,7 @@ function TokenDetail({ token }) {
             <span>zone {r.zone_id}</span>
             <span>types {(r.record_types || []).join(', ')}</span>
             {r.record_ids && r.record_ids.length > 0 && <span>ids {r.record_ids.join(', ')}</span>}
+            {r.content_lock != null && <span>content {r.content_lock}</span>}
           </div>
           <div className="row-actions">
             <Badge variant={r.allow_read ? 'ok' : 'muted'}>read</Badge>
@@ -196,6 +197,7 @@ function emptyRule() {
   return {
     zone_id: '', name_match: 'exact', name_pattern: '', anyType: false,
     record_types: ['A'], record_ids: [], allow_read: true, allow_create: false, allow_write: false, allow_delete: false,
+    content_lock: '',
   }
 }
 
@@ -216,9 +218,26 @@ function MintModal({ onClose, onMinted }) {
   }, [toast])
 
   useEffect(() => {
-    if (!credId) { setZones([]); return }
-    apiGet(`/api/v1/upstream-credentials/${credId}/zones`).then((z) => setZones(z || [])).catch(() => setZones([]))
+    let alive = true
+    if (!credId) {
+      setZones([])
+      return () => { alive = false }
+    }
+    setZones([])
+    apiGet(`/api/v1/upstream-credentials/${credId}/zones`)
+      .then((z) => { if (alive) setZones(z || []) })
+      .catch(() => { if (alive) setZones([]) })
+    return () => { alive = false }
   }, [credId])
+
+  function changeCredential(value) {
+    setCredId(value)
+    setRules((current) => current.map((rule) => ({
+      ...rule,
+      zone_id: '',
+      record_ids: [],
+    })))
+  }
 
   function patchRule(i, patch) {
     setRules((rs) => rs.map((r, idx) => (idx === i ? { ...r, ...patch } : r)))
@@ -245,6 +264,7 @@ function MintModal({ onClose, onMinted }) {
         allow_create: r.allow_create,
         allow_write: r.allow_write,
         allow_delete: r.allow_delete,
+        content_lock: r.content_lock === '' ? null : r.content_lock,
       })),
     }
     setBusy(true)
@@ -265,7 +285,7 @@ function MintModal({ onClose, onMinted }) {
             <Input value={name} required onChange={(e) => setName(e.target.value)} placeholder="staging-acme-dns" />
           </Field>
           <Field label="Upstream credential" hint="The broad credential this token forwards through.">
-            <Select value={credId} required onChange={(e) => setCredId(e.target.value)}>
+            <Select value={credId} required onChange={(e) => changeCredential(e.target.value)}>
               <option value="">Select credential…</option>
               {creds.map((c) => <option key={c.id} value={c.id}>{c.label} · {c.cred_type}</option>)}
             </Select>
@@ -305,15 +325,26 @@ function RuleEditor({ index, rule, zones, credId, onPatch, onRemove }) {
   const toast = useToast()
   const [records, setRecords] = useState(null)
   const [picker, setPicker] = useState(false)
+  const recordRequest = useRef(0)
+
+  useEffect(() => {
+    recordRequest.current += 1
+    setPicker(false)
+    setRecords(null)
+  }, [credId, rule.zone_id])
 
   async function loadRecords() {
     setPicker(true)
     if (records !== null) return
+    const request = ++recordRequest.current
     try {
-      setRecords((await apiGet(`/api/v1/upstream-credentials/${credId}/zones/${rule.zone_id}/records`)) || [])
+      const result = (await apiGet(`/api/v1/upstream-credentials/${credId}/zones/${rule.zone_id}/records`)) || []
+      if (recordRequest.current === request) setRecords(result)
     } catch (err) {
-      toast.error(err.message)
-      setRecords([])
+      if (recordRequest.current === request) {
+        toast.error(err.message)
+        setRecords([])
+      }
     }
   }
 
@@ -335,7 +366,7 @@ function RuleEditor({ index, rule, zones, credId, onPatch, onRemove }) {
 
       <div className="rule-grid">
         <Field label="Zone">
-          <Select value={rule.zone_id} onChange={(e) => onPatch({ zone_id: e.target.value })}>
+          <Select value={rule.zone_id} onChange={(e) => onPatch({ zone_id: e.target.value, record_ids: [] })}>
             <option value="">Select zone…</option>
             {zones.map((z) => <option key={z.id} value={z.id}>{z.name}</option>)}
           </Select>
@@ -401,6 +432,11 @@ function RuleEditor({ index, rule, zones, credId, onPatch, onRemove }) {
           <Toggle checked={rule.allow_delete} onChange={(v) => onPatch({ allow_delete: v })} label="delete" />
         </div>
       </div>
+
+      <Field label="Content lock" hint="Optional exact DNS content required for create and update operations.">
+        <Input value={rule.content_lock} onChange={(e) => onPatch({ content_lock: e.target.value })}
+          placeholder="Exact content, including whitespace" />
+      </Field>
     </div>
   )
 }

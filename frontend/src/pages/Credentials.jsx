@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { apiDelete, apiGet, apiPost } from '../api/client.js'
 import {
   Badge, Button, CopyButton, EmptyState, Field, Input, Modal, PageHeader, Panel, Select, Spinner, Table, useToast,
@@ -21,12 +22,14 @@ function verifyVariant(status) {
  * delete, and browse the zones/records a credential can see.
  */
 export default function Credentials() {
+  const [searchParams] = useSearchParams()
   const toast = useToast()
   const [loading, setLoading] = useState(true)
   const [creds, setCreds] = useState([])
   const [addOpen, setAddOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [browse, setBrowse] = useState(null)
+  const [connecting, setConnecting] = useState(false)
 
   async function load() {
     setLoading(true)
@@ -61,14 +64,34 @@ export default function Credentials() {
     }
   }
 
+  async function connectCloudflare() {
+    setConnecting(true)
+    try {
+      const data = await apiPost('/api/v1/upstream-credentials/cf/connect')
+      window.location.assign(data.authorization_url)
+    } catch (err) {
+      toast.error(err.message)
+      setConnecting(false)
+    }
+  }
+
   return (
     <div className="reveal">
       <PageHeader
         title="Credentials"
         subtitle="Broad upstream Cloudflare credentials the proxy forwards through."
-        actions={<Button variant="accent" onClick={() => setAddOpen(true)}>Add credential</Button>}
+        actions={
+          <>
+            <Button variant="ghost" disabled={connecting} onClick={connectCloudflare}>
+              {connecting ? <Spinner label="Connecting" /> : 'Connect Cloudflare'}
+            </Button>
+            <Button variant="accent" onClick={() => setAddOpen(true)}>Add credential</Button>
+          </>
+        }
       />
 
+      {searchParams.get('cf_status') === 'connected' && <Panel>Cloudflare credential connected.</Panel>}
+      {searchParams.has('cf_error') && <Panel>Cloudflare connection failed. Start a new connection attempt.</Panel>}
       <Panel>
         {loading ? (
           <Spinner label="Loading credentials" />

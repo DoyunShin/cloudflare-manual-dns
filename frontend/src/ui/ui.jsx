@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 
 /**
@@ -311,10 +311,10 @@ export function ToastProvider({ children }) {
     [remove],
   )
 
-  const toast = {
+  const toast = useMemo(() => ({
     success: (message) => push('ok', message),
     error: (message) => push('bad', message),
-  }
+  }), [push])
 
   return (
     <ToastContext.Provider value={toast}>
