@@ -24,6 +24,15 @@ _MUTATION_OPS = {
 _RENAME_METHODS = {"PATCH", "PUT"}
 
 
+def _match_content_rules(rules: Any, zone_id: str, name: str | None, rtype: str, record_id: str | None, op: str, content: Any) -> bool:
+    """Require one granting rule to match both the identity and literal content."""
+    return any(
+        match_rules([rule], zone_id, name, rtype, record_id, op)
+        and (getattr(rule, "content_lock", None) is None or content == rule.content_lock)
+        for rule in rules
+    )
+
+
 @dataclass
 class AuthDecision:
     """Outcome of authorizing a single DNS-record request.
@@ -86,7 +95,7 @@ async def authorize_dns_request(
     if method_upper == "POST":
         name = (body or {}).get("name")
         rtype = (body or {}).get("type")
-        if match_rules(rules, zone_id, name, rtype, None, "create"):
+        if _match_content_rules(rules, zone_id, name, rtype, None, "create", (body or {}).get("content")):
             return AuthDecision(allowed=True)
         return AuthDecision(
             allowed=False,
@@ -128,13 +137,13 @@ async def authorize_dns_request(
 
     if method_upper in _RENAME_METHODS:
         post_name, post_type = merge_patch_image(pre, body or {})
-        if (post_name, post_type) != (pre_name, pre_type):
-            if not match_rules(rules, zone_id, post_name, post_type, record_id, op):
-                return AuthDecision(
-                    allowed=False,
-                    needs_lock=needs_lock,
-                    error=(403, FORBIDDEN, "Authorization error: insufficient scope"),
-                    pre_image=pre,
-                )
+        post_content = (body or {}).get("content", pre.get("content") if method_upper == "PATCH" else None)
+        if not _match_content_rules(rules, zone_id, post_name, post_type, record_id, op, post_content):
+            return AuthDecision(
+                allowed=False,
+                needs_lock=needs_lock,
+                error=(403, FORBIDDEN, "Authorization error: insufficient scope"),
+                pre_image=pre,
+            )
 
     return AuthDecision(allowed=True, needs_lock=needs_lock, pre_image=pre)

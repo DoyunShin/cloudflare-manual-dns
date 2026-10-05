@@ -21,6 +21,7 @@ def make_rule(
     allow_create: bool = False,
     allow_write: bool = False,
     allow_delete: bool = False,
+    content_lock: str | None = None,
 ) -> SimpleNamespace:
     """Build a `ScopeRule`-shaped `SimpleNamespace` for test fixtures.
 
@@ -38,6 +39,7 @@ def make_rule(
         allow_create=allow_create,
         allow_write=allow_write,
         allow_delete=allow_delete,
+        content_lock=content_lock,
     )
 
 
@@ -429,3 +431,40 @@ async def test_needs_lock_computed_before_fetch_even_when_denied() -> None:
     assert decision.allowed is False
     assert decision.needs_lock is False
     assert decision.error == (404, RECORD_NOT_FOUND, decision.error[2])
+
+
+@pytest.mark.parametrize("method", ["POST", "PATCH", "PUT"])
+@pytest.mark.parametrize("content,allowed", [("192.0.2.1", True), ("192.0.2.2", False), (None, False)])
+async def test_content_lock_requires_literal_post_content(method: str, content: str | None, allowed: bool) -> None:
+    """Every creation/update checks the resulting content even without a rename."""
+    rules = [make_rule(allow_create=True, allow_write=True, content_lock="192.0.2.1")]
+    body = {"name": "home.example.com", "type": "A", "content": content}
+    decision = await authorize_dns_request(rules=rules, method=method, zone_id="zone1", record_id=None if method == "POST" else "rec1", body=body, fetch_record=make_fetch_record({"name": "home.example.com", "type": "A", "content": "192.0.2.1"}))
+    assert decision.allowed is allowed
+    if not allowed:
+        assert decision.error[0] == 403
+
+
+@pytest.mark.parametrize("method,allowed", [("PATCH", True), ("PUT", False)])
+async def test_content_lock_omission_uses_pre_image_only_for_patch(method: str, allowed: bool) -> None:
+    """PATCH preserves omitted content; locked PUT must provide content explicitly."""
+    rules = [make_rule(allow_write=True, content_lock="Exact TXT Value")]
+    decision = await authorize_dns_request(rules=rules, method=method, zone_id="zone1", record_id="rec1", body={"ttl": 60}, fetch_record=make_fetch_record({"name": "home.example.com", "type": "A", "content": "Exact TXT Value"}))
+    assert decision.allowed is allowed
+
+
+async def test_content_lock_does_not_combine_different_rules() -> None:
+    """A matching content in an unrelated rule cannot grant mutation permission."""
+    rules = [make_rule(name_pattern="home.example.com", allow_write=True, content_lock="one"), make_rule(name_pattern="other.example.com", allow_write=True, content_lock="two")]
+    decision = await authorize_dns_request(rules=rules, method="PATCH", zone_id="zone1", record_id="rec1", body={"content": "two"}, fetch_record=make_fetch_record({"name": "home.example.com", "type": "A", "content": "one"}))
+    assert not decision.allowed
+    rules.append(make_rule(name_pattern="home.example.com", allow_write=True, content_lock="two"))
+    decision = await authorize_dns_request(rules=rules, method="PATCH", zone_id="zone1", record_id="rec1", body={"content": "two"}, fetch_record=make_fetch_record({"name": "home.example.com", "type": "A", "content": "one"}))
+    assert decision.allowed
+
+
+async def test_content_lock_disables_write_lock_exemption() -> None:
+    """An id-pinned rule with a content constraint still needs a mutation lock."""
+    rules = [make_rule(record_ids=["rec1"], record_types=["*"], allow_write=True, content_lock="one")]
+    decision = await authorize_dns_request(rules=rules, method="PATCH", zone_id="zone1", record_id="rec1", body={"content": "one"}, fetch_record=make_fetch_record({"name": "home.example.com", "type": "A", "content": "one"}))
+    assert decision.allowed and decision.needs_lock

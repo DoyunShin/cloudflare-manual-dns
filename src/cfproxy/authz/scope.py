@@ -211,6 +211,8 @@ def is_lock_exempt(
             continue
         if rule.name_pattern is not None:
             continue
+        if op == "write" and getattr(rule, "content_lock", None) is not None:
+            continue
         if rule.record_types != ["*"]:
             continue
         if not rule.record_ids or path_record_id not in rule.record_ids:

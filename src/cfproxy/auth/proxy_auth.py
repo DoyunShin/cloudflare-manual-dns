@@ -70,6 +70,7 @@ def _rule_to_cache_dict(rule: ScopeRule) -> dict:
         "allow_create": rule.allow_create,
         "allow_write": rule.allow_write,
         "allow_delete": rule.allow_delete,
+        "content_lock": rule.content_lock,
     }
 
 
