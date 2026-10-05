@@ -1,6 +1,6 @@
 """Tests for the cfproxy management routers (auth, credentials, tokens, audit).
 
-Covers: register->login->mint-token happy path; unauthorized 401 on every
+Covers: local-admin login -> mint-token happy path; unauthorized 401 on every
 protected endpoint; cross-user IDOR (404, not another user's data) across
 credentials and scoped tokens; and the {status,message,data} envelope shape.
 
@@ -16,6 +16,9 @@ from fastapi import FastAPI
 from httpx import Response
 
 from cfproxy.config import get_settings
+from cfproxy.core.security import MANAGEMENT_SESSION_COOKIE, hash_password
+from cfproxy.db.models import User
+from cfproxy.db.session import Sessionmaker
 from cfproxy.routers.audit import router as audit_router
 from cfproxy.routers.auth import router as auth_router
 from cfproxy.routers.credentials import router as credentials_router
@@ -53,8 +56,8 @@ def _record_ids_rule(**overrides) -> dict:
     return rule
 
 
-async def _register_and_login(client, email: str, password: str = "correct-horse-battery") -> str:
-    """Register a fresh local account and log in, returning its bearer JWT.
+async def _register_and_login(client, email: str, password: str = "correct-horse-battery") -> tuple[str, str]:
+    """Create a local administrator and log in with a service session.
 
     Args:
         client: The httpx.AsyncClient bound to the app under test.
@@ -62,23 +65,42 @@ async def _register_and_login(client, email: str, password: str = "correct-horse
         password(str): The account's plaintext password.
 
     Return:
-        jwt(str): The issued session JWT.
+        tuple[str, str]: CSRF token and opaque session cookie.
     """
-    register_resp = await client.post(
-        "/api/v1/auth/register", json={"email": email, "password": password}
-    )
-    assert register_resp.status_code == 201, register_resp.text
+    async with Sessionmaker() as session:
+        session.add(
+            User(
+                local_login=email.casefold(),
+                email=email,
+                password_hash=hash_password(password),
+                auth_provider="local",
+                is_admin=True,
+                is_active=True,
+            )
+        )
+        await session.commit()
 
     login_resp = await client.post(
-        "/api/v1/auth/login", json={"email": email, "password": password}
+        "/api/v1/auth/login",
+        headers={"Origin": get_settings().app_base_url},
+        json={"email": email, "password": password},
     )
     assert login_resp.status_code == 200, login_resp.text
-    return login_resp.json()["data"]["access_token"]
+    csrf_token = login_resp.json()["data"]["csrf_token"]
+    raw_cookie = client.cookies.get(MANAGEMENT_SESSION_COOKIE)
+    assert raw_cookie is not None
+    client.cookies.clear()
+    return csrf_token, raw_cookie
 
 
-def _auth_headers(jwt: str) -> dict:
-    """Build an Authorization header dict for the given JWT."""
-    return {"Authorization": f"Bearer {jwt}"}
+def _auth_headers(auth: tuple[str, str]) -> dict:
+    """Build service-session cookie, origin, and CSRF headers."""
+    csrf_token, raw_cookie = auth
+    return {
+        "Cookie": f"{MANAGEMENT_SESSION_COOKIE}={raw_cookie}",
+        "Origin": get_settings().app_base_url,
+        "X-CSRF-Token": csrf_token,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +109,8 @@ def _auth_headers(jwt: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_register_response_envelope_shape(async_client_factory) -> None:
-    """register returns the {status, message, data} envelope with a UserResponse."""
+async def test_public_registration_is_unavailable(async_client_factory) -> None:
+    """Public local-account registration is not exposed."""
     app = _build_app()
     async with async_client_factory(app) as client:
         response = await client.post(
@@ -96,38 +118,7 @@ async def test_register_response_envelope_shape(async_client_factory) -> None:
             json={"email": f"{uuid4().hex}@example.com", "password": "pw-12345678"},
         )
 
-    assert response.status_code == 201
-    body = response.json()
-    assert set(body.keys()) == {"status", "message", "data"}
-    assert body["status"] == 201
-    assert set(body["data"].keys()) == {
-        "id",
-        "email",
-        "auth_provider",
-        "is_active",
-        "created_at",
-    }
-
-
-@pytest.mark.asyncio
-async def test_register_duplicate_email_conflict(async_client_factory) -> None:
-    """Registering the same email twice is rejected with a 409 envelope."""
-    app = _build_app()
-    email = f"{uuid4().hex}@example.com"
-    async with async_client_factory(app) as client:
-        first = await client.post(
-            "/api/v1/auth/register", json={"email": email, "password": "pw-12345678"}
-        )
-        assert first.status_code == 201
-
-        second = await client.post(
-            "/api/v1/auth/register", json={"email": email, "password": "pw-12345678"}
-        )
-
-    assert second.status_code == 409
-    body = second.json()
-    assert body["status"] == 409
-    assert body["data"] is None
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -135,12 +126,23 @@ async def test_login_wrong_password_rejected(async_client_factory) -> None:
     """Logging in with the wrong password returns a 401 envelope."""
     app = _build_app()
     email = f"{uuid4().hex}@example.com"
-    async with async_client_factory(app) as client:
-        await client.post(
-            "/api/v1/auth/register", json={"email": email, "password": "right-password"}
+    async with Sessionmaker() as session:
+        session.add(
+            User(
+                local_login=email.casefold(),
+                email=email,
+                password_hash=hash_password("right-password"),
+                auth_provider="local",
+                is_admin=True,
+                is_active=True,
+            )
         )
+        await session.commit()
+    async with async_client_factory(app) as client:
         response = await client.post(
-            "/api/v1/auth/login", json={"email": email, "password": "wrong-password"}
+            "/api/v1/auth/login",
+            headers={"Origin": get_settings().app_base_url},
+            json={"email": email, "password": "wrong-password"},
         )
 
     assert response.status_code == 401
@@ -162,7 +164,7 @@ async def test_register_login_mint_token_flow(async_client_factory) -> None:
 
         me_resp = await client.get("/api/v1/auth/me", headers=headers)
         assert me_resp.status_code == 200
-        assert me_resp.json()["data"]["email"] is not None
+        assert me_resp.json()["data"]["user"]["email"] is not None
 
         cred_resp = await client.post(
             "/api/v1/upstream-credentials",
@@ -275,17 +277,6 @@ async def test_audit_logs_listed_with_result_info(async_client_factory) -> None:
     assert data["result_info"] == {"page": 1, "per_page": 50, "count": 0, "total_count": 0}
 
 
-@pytest.mark.asyncio
-async def test_cf_login_redirects(async_client_factory) -> None:
-    """GET /auth/cf/login issues a 302 redirect to the Cloudflare authorize endpoint."""
-    app = _build_app()
-    async with async_client_factory(app) as client:
-        response = await client.get("/api/v1/auth/cf/login", follow_redirects=False)
-
-    assert response.status_code == 302
-    assert response.headers["location"].startswith(get_settings().cf_oauth_issuer)
-
-
 # ---------------------------------------------------------------------------
 # Unauthorized 401
 # ---------------------------------------------------------------------------
@@ -301,9 +292,7 @@ async def test_cf_login_redirects(async_client_factory) -> None:
         ("GET", "/api/v1/audit-logs"),
     ],
 )
-async def test_protected_endpoints_reject_missing_token(
-    async_client_factory, method: str, path: str
-) -> None:
+async def test_protected_endpoints_reject_missing_token(async_client_factory, method: str, path: str) -> None:
     """Every protected endpoint rejects a request with no Authorization header."""
     app = _build_app()
     async with async_client_factory(app) as client:

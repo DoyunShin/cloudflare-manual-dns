@@ -9,7 +9,7 @@ import asyncio
 import sys
 from collections.abc import Sequence
 
-from prompt_toolkit import print_formatted_text
+from prompt_toolkit import print_formatted_text, prompt
 from prompt_toolkit.formatted_text import FormattedText
 from sqlalchemy import select
 
@@ -61,12 +61,27 @@ async def bootstrap_admin_command(email: str, password: str) -> None:
     Return:
         None
     """
+    normalized_login = email.casefold()
+    if not 3 <= len(normalized_login) <= 255:
+        _emit("[ERROR] admin email must be between 3 and 255 characters", "fg:red bold")
+        return
+    if not 8 <= len(password) <= 128:
+        _emit("[ERROR] admin password must be between 8 and 128 characters", "fg:red bold")
+        return
+
     async with Sessionmaker() as session:
-        existing = await session.execute(select(User).where(User.email == email))
+        existing = await session.execute(select(User).where(User.local_login == normalized_login))
         if existing.scalar_one_or_none() is not None:
             _emit(f"[ERROR] a user with email '{email}' already exists", "fg:red bold")
             return
-        user = User(email=email, password_hash=hash_password(password), auth_provider="local")
+        user = User(
+            local_login=normalized_login,
+            email=email,
+            password_hash=hash_password(password),
+            auth_provider="local",
+            is_admin=True,
+            is_active=True,
+        )
         session.add(user)
         await session.commit()
         await session.refresh(user)
@@ -79,7 +94,8 @@ async def discover_scope_command() -> None:
     Return:
         None
     """
-    scopes = await discover_dns_scope()
+    api_token = prompt("Cloudflare API token: ", is_password=True)
+    scopes = await discover_dns_scope(api_token)
     if not scopes:
         _emit("[INFO] no scopes returned", "fg:yellow")
         return
@@ -149,7 +165,6 @@ def build_console_parser() -> argparse.ArgumentParser:
         "bootstrap-admin", help="Create an initial local admin user"
     )
     bootstrap_parser.add_argument("--email", required=True, help="Admin login email")
-    bootstrap_parser.add_argument("--password", required=True, help="Admin login password")
 
     subparsers.add_parser(
         "discover-scope", help="List Cloudflare OAuth DNS scopes available upstream"
@@ -179,7 +194,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "init-db":
         asyncio.run(init_db_command())
     elif args.command == "bootstrap-admin":
-        asyncio.run(bootstrap_admin_command(args.email, args.password))
+        password = prompt("Admin password: ", is_password=True)
+        asyncio.run(bootstrap_admin_command(args.email, password))
     elif args.command == "discover-scope":
         asyncio.run(discover_scope_command())
     elif args.command == "tail-audit":

@@ -8,7 +8,6 @@ Redis connection.
 """
 
 import os
-import secrets
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -20,16 +19,17 @@ os.close(_tmp_db_fd)
 
 os.environ.setdefault("DB_URL", f"sqlite+aiosqlite:///{_tmp_db_path}")
 os.environ.setdefault("PROXY_SECRET_KEY", Fernet.generate_key().decode())
-os.environ.setdefault("JWT_SECRET", secrets.token_urlsafe(32))
+os.environ.setdefault("APP_BASE_URL", "https://testserver")
 
 import fakeredis.aioredis
 import httpx
 import pytest_asyncio
 from fastapi import FastAPI
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cfproxy.cache import redis as cache_redis
-from cfproxy.db.models import Base
+from cfproxy.db.models import Base, OIDCConfig
 from cfproxy.db.session import Sessionmaker, engine
 
 
@@ -38,6 +38,24 @@ async def _create_tables() -> AsyncIterator[None]:
     """Ensure all tables exist before every test (idempotent, cheap on SQLite)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    async with Sessionmaker() as session:
+        for table in reversed(Base.metadata.sorted_tables):
+            await session.execute(delete(table))
+        session.add(
+            OIDCConfig(
+                id=1,
+                label="OIDC",
+                issuer="",
+                client_id="",
+                client_secret_enc="",
+                scopes="openid profile email",
+                enabled=False,
+                revision=1,
+                allowed_endpoint_origins=[],
+                allow_private_network=False,
+            )
+        )
+        await session.commit()
     yield
 
 
@@ -70,7 +88,7 @@ async def _async_client_for_app(app: FastAPI) -> AsyncIterator[httpx.AsyncClient
             to the given app, without touching the network.
     """
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
         yield client
 
 

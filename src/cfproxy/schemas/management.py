@@ -2,27 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
-
-
-class RegisterRequest(BaseModel):
-    """Request body for local account registration.
-
-    Args:
-        email(str): The account's email address.
-        password(str): The account's plaintext password.
-    """
-
-    email: str
-    password: str
-
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {"email": "operator@example.com", "password": "correct-horse-battery-staple"},
-            ],
-        },
-    }
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -33,39 +13,17 @@ class LoginRequest(BaseModel):
         password(str): The account's plaintext password.
     """
 
-    email: str
-    password: str
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=8, max_length=128)
 
-    model_config = {
-        "json_schema_extra": {
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
             "examples": [
                 {"email": "operator@example.com", "password": "correct-horse-battery-staple"},
             ],
         },
-    }
-
-
-class TokenResponse(BaseModel):
-    """Response body containing an issued JWT session token.
-
-    Args:
-        access_token(str): The signed JWT.
-        token_type(str): The token type, always "bearer".
-    """
-
-    access_token: str
-    token_type: str = "bearer"
-
-    model_config = {
-        "json_schema_extra": {
-            "examples": [
-                {
-                    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-                    "token_type": "bearer",
-                },
-            ],
-        },
-    }
+    )
 
 
 class UserResponse(BaseModel):
@@ -74,14 +32,18 @@ class UserResponse(BaseModel):
     Args:
         id(str): The user's id.
         email(str, optional): The user's email address.
-        auth_provider(str): The authentication provider ("local" or "cloudflare").
+        display_name(str, optional): The user's display name.
+        auth_provider(str): The authentication provider ("local" or "oidc").
+        is_admin(bool): Whether the user has service administrator access.
         is_active(bool): Whether the account is active.
         created_at(datetime): Account creation timestamp.
     """
 
     id: str
     email: str | None
+    display_name: str | None
     auth_provider: str
+    is_admin: bool
     is_active: bool
     created_at: datetime
 
@@ -92,13 +54,58 @@ class UserResponse(BaseModel):
                 {
                     "id": "5b1e2f0a-9a3b-4a0e-9c1a-8f6d3c2b7a10",
                     "email": "operator@example.com",
+                    "display_name": "DNS Operator",
                     "auth_provider": "local",
+                    "is_admin": True,
                     "is_active": True,
                     "created_at": "2026-07-15T09:30:00+00:00",
                 },
             ],
         },
     }
+
+
+class SessionResponse(BaseModel):
+    """Response body exposing the current user and in-memory CSRF token."""
+
+    user: UserResponse
+    csrf_token: str
+
+
+class UserAdminUpdateRequest(BaseModel):
+    """Administrator-controlled service authorization fields."""
+
+    is_admin: bool | None = None
+    is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def require_change(self) -> "UserAdminUpdateRequest":
+        """Require at least one explicit authorization update."""
+        if self.is_admin is None and self.is_active is None:
+            raise ValueError("At least one of is_admin or is_active is required")
+        return self
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"is_admin": True, "is_active": True}]},
+    )
+
+
+class ResultInfo(BaseModel):
+    """Pagination metadata for management collection responses."""
+
+    page: int
+    per_page: int
+    count: int
+    total_count: int
+    total_pages: int
+
+
+class UserListResponse(BaseModel):
+    """Paginated service-user collection."""
+
+    items: list[UserResponse]
+    result_info: ResultInfo
 
 
 class UpstreamCredentialCreateRequest(BaseModel):

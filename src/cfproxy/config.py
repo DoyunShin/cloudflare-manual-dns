@@ -1,7 +1,9 @@
 """Application settings for cfproxy."""
 
 from functools import lru_cache
+from urllib.parse import urlsplit
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,8 +14,8 @@ class Settings(BaseSettings):
         db_url(str): SQLAlchemy async database URL.
         redis_url(str): Redis connection URL.
         proxy_secret_key(str): Fernet key used to encrypt/decrypt stored secrets.
-        jwt_secret(str): HMAC secret used to sign management JWTs.
-        jwt_ttl_seconds(int): Lifetime of issued JWTs in seconds.
+        app_base_url(str): Trusted public HTTPS origin for browser management requests.
+        session_ttl_seconds(int): Lifetime of server-side management sessions.
         upstream_base_url(str): Base URL for the Cloudflare API.
         cf_oauth_issuer(str): Cloudflare OAuth issuer base URL.
         cf_oauth_client_id(str): OAuth client id registered with Cloudflare.
@@ -33,8 +35,8 @@ class Settings(BaseSettings):
     db_url: str
     redis_url: str = "redis://localhost:6379/0"
     proxy_secret_key: str
-    jwt_secret: str
-    jwt_ttl_seconds: int = 86400
+    app_base_url: str = "https://localhost"
+    session_ttl_seconds: int = 86400
     upstream_base_url: str = "https://api.cloudflare.com"
     cf_oauth_issuer: str = "https://dash.cloudflare.com"
     cf_oauth_client_id: str = ""
@@ -47,6 +49,23 @@ class Settings(BaseSettings):
     rules_cache_ttl: int = 300
     access_token_skew: int = 60
     web_concurrency: int = 4
+
+    @field_validator("app_base_url")
+    @classmethod
+    def validate_app_base_url(cls, value: str) -> str:
+        """Require a path-free HTTPS origin for browser security checks."""
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
+            raise ValueError("APP_BASE_URL must be an HTTPS origin without path, query, or fragment")
+        return value.rstrip("/")
 
 
 @lru_cache
