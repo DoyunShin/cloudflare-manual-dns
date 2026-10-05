@@ -1,70 +1,57 @@
-import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { useAuth } from '../auth/AuthContext.jsx'
-import { Button, Field, Input, Spinner, useToast } from '../ui/ui.jsx'
+import { useEffect, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
+import { apiGet } from '../api/client.js'
+import { Button, Spinner } from '../ui/ui.jsx'
 
 /**
- * Split-screen login: branded Signal Control panel + credential form,
- * with a secondary Cloudflare OAuth entry point.
+ * Public OIDC sign-in page. Local recovery login is kept on /admin/login.
  */
 export default function Login() {
-  const { login } = useAuth()
-  const navigate = useNavigate()
-  const toast = useToast()
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [busy, setBusy] = useState(false)
+  const [searchParams] = useSearchParams()
+  const [provider, setProvider] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const oidcError = searchParams.get('oidc_error')
 
-  async function onSubmit(event) {
-    event.preventDefault()
-    setBusy(true)
-    try {
-      await login(email, password)
-      navigate('/')
-    } catch (err) {
-      toast.error(err.message)
-    } finally {
-      setBusy(false)
-    }
-  }
+  useEffect(() => {
+    let alive = true
+    apiGet('/api/v1/auth/oidc')
+      .then((data) => { if (alive) setProvider(data) })
+      .catch(() => { if (alive) setProvider(null) })
+      .finally(() => { if (alive) setLoading(false) })
+    return () => { alive = false }
+  }, [])
 
   return (
     <div className="auth-split">
       <AuthBrand />
       <div className="auth-form-side">
-        <form className="panel auth-card reveal" onSubmit={onSubmit}>
+        <section className="panel auth-card reveal">
           <div className="panel-body">
             <p className="label" style={{ color: 'var(--accent)' }}>Operator sign-in</p>
             <h2 className="auth-heading">Access the console</h2>
-            <Field label="Email">
-              <Input type="email" autoComplete="username" value={email} required
-                onChange={(e) => setEmail(e.target.value)} placeholder="operator@example.com" />
-            </Field>
-            <Field label="Password">
-              <Input type="password" autoComplete="current-password" value={password} required
-                onChange={(e) => setPassword(e.target.value)} placeholder="password" />
-            </Field>
-            <Button type="submit" variant="accent" disabled={busy} style={{ width: '100%', marginTop: 6 }}>
-              {busy ? <Spinner label="Signing in" /> : 'Sign in'}
-            </Button>
-            <div className="auth-divider"><span>or</span></div>
-            <Button type="button" variant="ghost" style={{ width: '100%' }}
-              onClick={() => { window.location.href = '/api/v1/auth/cf/login' }}>
-              Continue with Cloudflare
-            </Button>
+            {oidcError && (
+              <p className="auth-error">OIDC sign-in could not be completed. Try again or contact an administrator.</p>
+            )}
+            {loading ? (
+              <Spinner label="Loading sign-in options" />
+            ) : provider?.enabled ? (
+              <Button type="button" variant="accent" style={{ width: '100%' }}
+                onClick={() => window.location.assign('/api/v1/auth/oidc/login')}>
+                Continue with {provider.label || 'OIDC'}
+              </Button>
+            ) : (
+              <p className="auth-notice">OIDC sign-in is not configured. Ask a local administrator to configure a provider.</p>
+            )}
             <p className="auth-alt">
-              No account? <Link to="/register">Create one</Link>
+              Administrator recovery? <Link to="/admin/login">Use local sign-in</Link>
             </p>
           </div>
-        </form>
+        </section>
       </div>
     </div>
   )
 }
 
-/**
- * Shared branded panel rendered on the left of the auth screens.
- */
 export function AuthBrand() {
   return (
     <aside className="auth-brand">

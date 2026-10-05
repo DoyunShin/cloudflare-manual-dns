@@ -786,7 +786,7 @@ textarea:focus-visible,
 }
 
 /* ==========================================================================
-   Auth screens (Login / Register)
+   Auth screens
    ========================================================================== */
 
 .auth-split {
@@ -897,6 +897,21 @@ textarea:focus-visible,
 
 .auth-alt a { color: var(--accent); }
 
+.auth-notice {
+  color: var(--muted);
+  line-height: 1.55;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.auth-error {
+  color: var(--bad);
+  line-height: 1.55;
+  margin-bottom: 14px;
+}
+
 @media (max-width: 820px) {
   .auth-split { grid-template-columns: 1fr; }
   .auth-brand { display: none; }
@@ -914,6 +929,35 @@ textarea:focus-visible,
 }
 
 .muted-text { color: var(--muted); }
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 16px;
+}
+
+.settings-switches,
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.form-actions {
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.user-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+@media (max-width: 720px) {
+  .settings-grid { grid-template-columns: 1fr; }
+}
 
 .stat-grid {
   display: grid;

@@ -1,42 +1,30 @@
-import { createContext, useContext, useEffect, useState, useCallback } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { Navigate, useLocation } from 'react-router-dom'
-import { apiGet, apiPost, getToken, setToken, clearToken } from '../api/client.js'
+import { apiGet, apiPost, setCsrfToken } from '../api/client.js'
 
 const AuthContext = createContext(null)
 
-/**
- * Fetch the current authenticated user from the management API.
- *
- * Return:
- *     user(object): UserResponse payload
- */
-function fetchCurrentUser() {
+async function fetchCurrentSession() {
   return apiGet('/api/v1/auth/me')
 }
 
 /**
- * Provide authentication state (current user, loading flag) and the
- * login/register/logout/refresh actions to the component tree.
- *
- * Args:
- *     children(ReactNode): wrapped application tree
+ * Provide cookie-backed authentication state and actions.
  */
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [loading, setLoading] = useState(true)
 
   const refresh = useCallback(async () => {
-    if (!getToken()) {
-      setUser(null)
-      setLoading(false)
-      return
-    }
     try {
-      const me = await fetchCurrentUser()
-      setUser(me)
+      const session = await fetchCurrentSession()
+      setCsrfToken(session?.csrf_token)
+      setUser(session?.user || null)
+      return session?.user || null
     } catch {
-      clearToken()
+      setCsrfToken(null)
       setUser(null)
+      return null
     } finally {
       setLoading(false)
     }
@@ -47,59 +35,44 @@ export function AuthProvider({ children }) {
   }, [refresh])
 
   const login = useCallback(async (email, password) => {
-    const data = await apiPost('/api/v1/auth/login', { email, password })
-    setToken(data.access_token)
-    const me = await fetchCurrentUser()
-    setUser(me)
-    return me
+    await apiPost('/api/v1/auth/login', { email, password })
+    const session = await fetchCurrentSession()
+    setCsrfToken(session?.csrf_token)
+    setUser(session?.user || null)
+    return session?.user || null
   }, [])
 
-  const register = useCallback(async (email, password) => {
-    return apiPost('/api/v1/auth/register', { email, password })
-  }, [])
-
-  const logout = useCallback(() => {
-    clearToken()
+  const logout = useCallback(async () => {
+    await apiPost('/api/v1/auth/logout')
+    setCsrfToken(null)
     setUser(null)
   }, [])
 
-  const value = { user, loading, login, register, logout, refresh }
+  const value = useMemo(
+    () => ({ user, loading, login, logout, refresh }),
+    [user, loading, login, logout, refresh],
+  )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
-/**
- * Access the current authentication state and actions.
- *
- * Return:
- *     ctx(object): {user, loading, login, register, logout, refresh}
- */
 export function useAuth() {
   const ctx = useContext(AuthContext)
-  if (!ctx) {
-    throw new Error('useAuth must be used within an AuthProvider')
-  }
+  if (!ctx) throw new Error('useAuth must be used within an AuthProvider')
   return ctx
 }
 
-/**
- * Route guard that redirects to /login when there is no authenticated
- * user once the initial auth check has finished.
- *
- * Args:
- *     children(ReactNode): protected route tree
- */
 export function ProtectedRoute({ children }) {
   const { user, loading } = useAuth()
   const location = useLocation()
 
-  if (loading) {
-    return null
-  }
+  if (loading) return null
+  if (!user) return <Navigate to="/login" replace state={{ from: location }} />
+  return children
+}
 
-  if (!user) {
-    return <Navigate to="/login" replace state={{ from: location }} />
-  }
-
+export function AdminRoute({ children }) {
+  const { user } = useAuth()
+  if (!user?.is_admin) return <Navigate to="/" replace />
   return children
 }

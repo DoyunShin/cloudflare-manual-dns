@@ -1,6 +1,6 @@
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext.jsx'
-import { Button } from '../ui/ui.jsx'
+import { Button, useToast } from '../ui/ui.jsx'
 
 const NAV_ITEMS = [
   { to: '/', label: 'Overview', end: true },
@@ -15,6 +15,18 @@ const NAV_ITEMS = [
  */
 export default function Layout() {
   const { user, logout } = useAuth()
+  const toast = useToast()
+  const navItems = user?.is_admin
+    ? [...NAV_ITEMS, { to: '/admin/users', label: 'Users' }, { to: '/admin/oidc', label: 'OIDC' }]
+    : NAV_ITEMS
+
+  async function handleLogout() {
+    try {
+      await logout()
+    } catch (err) {
+      toast.error(err.message)
+    }
+  }
 
   return (
     <div className="shell">
@@ -24,7 +36,7 @@ export default function Layout() {
           <span className="brand-name label">cfproxy</span>
         </div>
         <nav className="nav">
-          {NAV_ITEMS.map((item, i) => (
+          {navItems.map((item, i) => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -39,8 +51,8 @@ export default function Layout() {
       </aside>
       <div className="shell-main">
         <header className="topbar">
-          <span className="topbar-user mono">{user?.email}</span>
-          <Button variant="ghost" onClick={logout}>
+          <span className="topbar-user mono">{user?.display_name || user?.email}</span>
+          <Button variant="ghost" onClick={handleLogout}>
             Logout
           </Button>
         </header>
